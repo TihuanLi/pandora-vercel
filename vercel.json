@@ -1,22 +1,20 @@
 {
+  "name": "pandora-cloud",
+  "version": 2,
+  "framework": null,
   "builds": [
     {
-      "src": "src/pandora_cloud/server.py",
+      "src": "main.py",
       "use": "@vercel/python"
     }
   ],
   "rewrites": [
     {
-      "source":"/api/:path((?!auth|accounts).*)",
-      "destination":"https://ai.fakeopen.com/api/:path*"
-    },
-    {
-      "source":"/v1/:path(.*)",
-      "destination":"https://api.openai.com/v1/:path*"
-    },
-    {
       "source": "/(.*)",
-      "destination": "src/pandora_cloud/server.py"
+      "destination": "main.py"
     }
-  ]
+  ],
+  "env": {
+    "PANDORA_SERVER_LISTEN": "false"
+  }
 }
