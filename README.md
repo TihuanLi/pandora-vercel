@@ -1,19 +1,7 @@
-# 已出官方版本，可移步[pengzhile/pandora-cloud-serverless](https://github.com/pengzhile/pandora-cloud-serverless)
+# 官方版本移步[pengzhile/pandora-cloud-serverless](https://github.com/pengzhile/pandora-cloud-serverless)
 
 # Pandora-Vercel
-本项目修改了 [Pandora-Cloud](https://github.com/pengzhile/pandora-cloud) 的代码结构，使其能够在 [Vercel](https://vercel.com) 以及 [Zeabur](https://Zeabur.com)、[Railway](https://railway.app) 等平台部署。主要以支持 Vercel 为主，包含 api 反代以及 fakeopen 反代。  
-
-## 一键部署
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fchrysoljq%2Fpandora-vercel&project-name=pandora-vercel&framework=other)
-+ 测试网站 [https://pandora-vercel-lovat.vercel.app](https://pandora-vercel-lovat.vercel.app)
-+ 本地运行
-```bash
-npm install -g vercel
-vercel dev
-```
-
-## 自动更新
-若要自动同步本仓库，可参考教程 [保持更新](https://github.com/Yidadaa/ChatGPT-Next-Web/blob/main/README_CN.md#%E4%BF%9D%E6%8C%81%E6%9B%B4%E6%96%B0)。
+本项目修改了 [Pandora-Cloud](https://github.com/pengzhile/pandora-cloud) 的Web UI，又在[Pandora-Vercel](https://github.com/chrysoljq/pandora-vercel) 的基础上进行了修改，实现了本地修改后上传至Vercel进行部署。
 
 ## **环境变量**
 #### `CHATGPT_API_PREFIX`  
