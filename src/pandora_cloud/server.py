@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from os import getenv
 from os.path import join, abspath, dirname
 
@@ -10,36 +10,95 @@ from flask import Flask, jsonify, request, render_template, redirect, url_for, m
 from pandora.exts.hooks import hook_logging
 from pandora.exts.token import check_access_token
 from pandora.openai.auth import Auth0
+from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.serving import WSGIRequestHandler
 
-__version__ = '0.4.4'
+from . import __version__
 
 
 class ChatBot:
-    build_id = 'cx416mT2Lb0ZTj5FxFg1l'
+    __default_ip = '127.0.0.1'
+    __default_port = 8018
+    __build_id = 'cx416mT2Lb0ZTj5FxFg1l'
 
-    def __init__(self, proxy=None, debug=False, sentry=False):
+    def __init__(self, proxy, debug=False, sentry=False, login_local=False):
         self.proxy = proxy
         self.debug = debug
         self.sentry = sentry
-        self.login_local = getenv('LOGIN_LOCAL', True)
+        self.login_local = login_local
         self.log_level = logging.DEBUG if debug else logging.WARN
-        self.api_prefix = getenv('CHATGPT_API_PREFIX',
-                                 'https://ai.fakeopen.com')
 
-        hook_logging(level=self.log_level,
-                     format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
+        hook_logging(level=self.log_level, format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
         self.logger = logging.getLogger('waitress')
 
+    def run(self, bind_str, threads=8, listen=True):
+        host, port = self.__parse_bind(bind_str)
+
+        resource_path = abspath(join(dirname(__file__), 'flask'))
+        app = Flask(__name__, static_url_path='',
+                    static_folder=join(resource_path, 'static'),
+                    template_folder=join(resource_path, 'templates'))
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_port=1)
+        app.after_request(self.__after_request)
+
+        app.route('/api/auth/session')(self.session)
+        app.route('/api/accounts/check/v4-2023-04-27')(self.check)
+        app.route('/auth/logout')(self.logout)
+        app.route('/error/404')(self.error404)
+        app.route('/_next/data/{}/index.json'.format(self.__build_id))(self.chat_info)
+        app.route('/_next/data/{}/c/<conversation_id>.json'.format(self.__build_id))(self.chat_info)
+        app.route('/_next/data/{}/share/<share_id>.json'.format(self.__build_id))(self.share_info)
+        app.route('/_next/data/{}/share/<share_id>/continue.json'.format(self.__build_id))(self.share_continue_info)
+
+        app.route('/')(self.chat)
+        app.route('/c')(self.chat)
+
+        app.route('/c/<conversation_id>')(self.chat)
+        app.route('/share/<share_id>')(self.share_detail)
+        app.route('/share/<share_id>/continue')(self.share_continue)
+
+        app.route('/chat')(self.chat_index)
+        app.route('/chat/<conversation_id>')(self.chat_index)
+
+        app.route('/auth/login')(self.login)
+        app.route('/auth/login_share')(self.login_share_token)
+        app.route('/auth/login', methods=['POST'])(self.login_post)
+        app.route('/auth/login_token', methods=['POST'])(self.login_token)
+
+        if not self.debug:
+            self.logger.warning('Serving on http://{}:{}'.format(host, port))
+
+        WSGIRequestHandler.protocol_version = 'HTTP/1.1'
+        if listen:
+            serve(app, host=host, port=port, ident=None, threads=threads)
+
+        return app
+
     @staticmethod
-    def after_request(resp):
+    def __after_request(resp):
         resp.headers['X-Server'] = 'pandora-cloud/{}'.format(__version__)
         return resp
 
+    def __parse_bind(self, bind_str):
+        sections = bind_str.split(':', 2)
+        if len(sections) < 2:
+            try:
+                port = int(sections[0])
+                return self.__default_ip, port
+            except ValueError:
+                return sections[0], self.__default_port
+
+        return sections[0], int(sections[1])
+
+    @staticmethod
+    def __get_api_prefix():
+        default = 'https://ai-{}.fakeopen.com'.format((datetime.now() - timedelta(days=1)).strftime('%Y%m%d'))
+        return getenv('CHATGPT_API_PREFIX', default)
+
     @staticmethod
     def __set_cookie(resp, token, expires):
-        resp.set_cookie('access-token', token, expires=expires,
-                        path='/', domain=None, httponly=True, samesite='Lax')
+        resp.set_cookie('access-token', token, expires=expires, path='/', domain=None, httponly=True, samesite='Lax')
 
     async def __get_userinfo(self):
         access_token = request.cookies.get('access-token')
@@ -60,17 +119,20 @@ class ChatBot:
         return False, user_id, email, access_token, payload
 
     async def __fetch_share_tokeninfo(self, share_token):
-        url = self.api_prefix + '/token/info/{}'.format(share_token)
+        url = self.__get_api_prefix() + '/token/info/{}'.format(share_token)
 
         async with httpx.AsyncClient(proxies=self.proxy, timeout=30) as client:
             response = await client.get(url)
+            if response.status_code == 404:
+                raise Exception('share token not found or expired')
+
             if response.status_code != 200:
                 raise Exception('failed to fetch share token info')
 
             return response.json()
 
     async def __fetch_share_detail(self, share_id):
-        url = self.api_prefix + '/api/share/{}'.format(share_id)
+        url = self.__get_api_prefix() + '/api/share/{}'.format(share_id)
 
         async with httpx.AsyncClient(proxies=self.proxy, timeout=30) as client:
             response = await client.get(url)
@@ -92,8 +154,7 @@ class ChatBot:
         return resp
 
     async def login(self):
-        template = 'login_full.html' if self.login_local else 'login.html'
-        return render_template(template, api_prefix=self.api_prefix, next=request.args.get('next', ''))
+        return render_template('login.html', api_prefix=self.__get_api_prefix(), next=request.args.get('next', ''))
 
     async def login_post(self):
         username = request.form.get('username')
@@ -104,8 +165,7 @@ class ChatBot:
 
         if username and password:
             try:
-                access_token = Auth0(
-                    username, password, self.proxy, mfa=mfa_code).auth(self.login_local)
+                access_token = Auth0(username, password, self.proxy, mfa=mfa_code).auth(self.login_local)
                 payload = check_access_token(access_token)
 
                 resp = make_response('please wait...', 302)
@@ -116,8 +176,26 @@ class ChatBot:
             except Exception as e:
                 error = str(e)
 
-        template = 'login_full.html' if self.login_local else 'login.html'
-        return render_template(template, username=username, error=error, api_prefix=self.api_prefix)
+        return render_template('login.html', username=username, error=error, api_prefix=self.__get_api_prefix())
+
+    async def login_share_token(self):
+        share_token = request.args.get('token')
+        error = None
+
+        if share_token and share_token.startswith('fk-'):
+            try:
+                ti = await self.__fetch_share_tokeninfo(share_token)
+                payload = {'exp': ti['expire_at']}
+
+                resp = make_response('please wait...', 307)
+                resp.headers.set('Location', '/')
+                self.__set_cookie(resp, share_token, payload['exp'])
+
+                return resp
+            except Exception as e:
+                error = str(e)
+
+        return render_template('login.html', error=error, api_prefix=self.__get_api_prefix())
 
     async def login_token(self):
         access_token = request.form.get('access_token')
@@ -131,8 +209,7 @@ class ChatBot:
                     ti = await self.__fetch_share_tokeninfo(access_token)
                     payload = {'exp': ti['expire_at']}
 
-                resp = jsonify(
-                    {'code': 0, 'url': next_url if next_url else '/'})
+                resp = jsonify({'code': 0, 'url': next_url if next_url else '/'})
                 self.__set_cookie(resp, access_token, payload['exp'])
 
                 return resp
@@ -174,14 +251,14 @@ class ChatBot:
             },
             'page': '/c/[chatId]' if conversation_id else '/',
             'query': query,
-            'buildId': self.build_id,
+            'buildId': self.__build_id,
             'isFallback': False,
             'gssp': True,
             'scriptLoader': []
         }
 
         template = 'detail.html' if conversation_id else 'chat.html'
-        return render_template(template, pandora_sentry=self.sentry, api_prefix=self.api_prefix, props=props)
+        return render_template(template, pandora_sentry=self.sentry, api_prefix=self.__get_api_prefix(), props=props)
 
     async def session(self):
         err, user_id, email, access_token, payload = await self.__get_userinfo()
@@ -199,10 +276,25 @@ class ChatBot:
             },
             'expires': datetime.utcfromtimestamp(payload['exp']).isoformat(),
             'accessToken': access_token,
-            'authProvider': 'auth0'
+            'authProvider': 'auth0',
         }
 
         return jsonify(ret)
+
+    async def error404(self):
+        props = {
+            'props': {
+                'pageProps': {'statusCode': 404}
+            },
+            'page': '/_error',
+            'query': {},
+            'buildId': self.__build_id,
+            'nextExport': True,
+            'isFallback': False,
+            'gip': True,
+            'scriptLoader': []
+        }
+        return render_template('404.html', pandora_sentry=self.sentry, api_prefix=self.__get_api_prefix(), props=props)
 
     async def share_detail(self, share_id):
         err, user_id, email, _, _ = await self.__get_userinfo()
@@ -218,13 +310,14 @@ class ChatBot:
                 },
                 'page': '/_error',
                 'query': {},
-                'buildId': self.build_id,
+                'buildId': self.__build_id,
                 'nextExport': True,
                 'isFallback': False,
                 'gip': True,
                 'scriptLoader': []
             }
-            return render_template('404.html', pandora_sentry=self.sentry, api_prefix=self.api_prefix, props=props)
+            return render_template('404.html', pandora_sentry=self.sentry, api_prefix=self.__get_api_prefix(),
+                                   props=props)
 
         if 'continue_conversation_url' in share_detail:
             share_detail['continue_conversation_url'] = share_detail['continue_conversation_url'].replace(
@@ -248,13 +341,14 @@ class ChatBot:
             'query': {
                 'shareParams': [share_id]
             },
-            'buildId': self.build_id,
+            'buildId': self.__build_id,
             'isFallback': False,
             'gssp': True,
             'scriptLoader': []
         }
 
-        return render_template('share.html', pandora_sentry=self.sentry, api_prefix=self.api_prefix, props=props)
+        return render_template('share.html', pandora_sentry=self.sentry, api_prefix=self.__get_api_prefix(),
+                               props=props)
 
     @staticmethod
     async def share_continue(share_id):
@@ -440,34 +534,3 @@ class ChatBot:
         }
 
         return jsonify(ret)
-
-
-bot = ChatBot()
-resource_path = abspath(join(dirname(__file__), 'flask'))
-app = Flask(__name__, static_url_path='',
-            static_folder=join(resource_path, 'static'),
-            template_folder=join(resource_path, 'templates'))
-app.wsgi_app = ProxyFix(app.wsgi_app, x_port=1)
-app.after_request(bot.after_request)
-
-app.route('/api/auth/session')(bot.session)
-app.route('/api/accounts/check/v4-2023-04-27')(bot.check)
-app.route('/auth/logout')(bot.logout)
-app.route('/_next/data/{}/index.json'.format(bot.build_id))(bot.chat_info)
-app.route('/_next/data/{}/c/<conversation_id>.json'.format(bot.build_id))(bot.chat_info)
-app.route('/_next/data/{}/share/<share_id>.json'.format(bot.build_id))(bot.share_info)
-app.route('/_next/data/{}/share/<share_id>/continue.json'.format(bot.build_id))(bot.share_continue_info)
-
-app.route('/')(bot.chat)
-app.route('/c')(bot.chat)
-app.route('/c/<conversation_id>')(bot.chat)
-
-app.route('/share/<share_id>')(bot.share_detail)
-app.route('/share/<share_id>/continue')(bot.share_continue)
-
-app.route('/chat')(bot.chat_index)
-app.route('/chat/<conversation_id>')(bot.chat_index)
-
-app.route('/auth/login')(bot.login)
-app.route('/auth/login', methods=['POST'])(bot.login_post)
-app.route('/auth/login_token', methods=['POST'])(bot.login_token)
